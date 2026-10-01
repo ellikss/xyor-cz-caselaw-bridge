@@ -21,7 +21,7 @@ CONFIG_COLUMNS = {
 }
 TOPIC_COLUMNS = ["case_number", "court_name", "ecli", "subject"]
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.2")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -164,10 +164,30 @@ async def build_candidate_index():
             INDEX_STATUS["configs"][config] = {"state": "ready", "parquet_files": len(files), **summary}
             print("XYOR_INDEX_CONFIG_READY", config, json.dumps(INDEX_STATUS["configs"][config], ensure_ascii=False), flush=True)
 
-        test = INDEX["justice"].filter(pl.col("case_number") == "10 C 73/2020-127").head(1)
-        print("XYOR_INDEX_EXACT_TEST", json.dumps(test.to_dicts(), ensure_ascii=False), flush=True)
+        exact = INDEX["justice"].filter(pl.col("case_number") == "10 C 73/2020-127").head(1)
+        print("XYOR_INDEX_EXACT_TEST", json.dumps(exact.to_dicts(), ensure_ascii=False), flush=True)
+
         topical = await asyncio.to_thread(_candidate_search, INDEX["justice"], "výpověď nájmu bytu", 3)
         print("XYOR_INDEX_TOPIC_TEST", json.dumps(topical.to_dicts(), ensure_ascii=False), flush=True)
+
+        provision = await asyncio.to_thread(_provision_search, INDEX["justice"], "§ 2291", 3)
+        print("XYOR_INDEX_PROVISION_TEST", json.dumps(provision.to_dicts(), ensure_ascii=False), flush=True)
+
+        if topical.height:
+            row_idx = int(topical[0, "row_idx"])
+            row_payload = await hf_get("rows", {"config": "justice", "split": "train", "offset": row_idx, "length": 1}, timeout=30.0)
+            row_items = row_payload.get("rows", [])
+            if row_items:
+                row = row_items[0].get("row") or {}
+                full_text = row.get("full_text") or ""
+                print("XYOR_INDEX_FULLTEXT_TEST", json.dumps({
+                    "row_idx": row_idx,
+                    "case_number": row.get("case_number"),
+                    "court_name": row.get("court_name"),
+                    "source_url": row.get("source_url"),
+                    "full_text_chars": len(full_text),
+                    "full_text_nonempty": bool(full_text.strip()),
+                }, ensure_ascii=False), flush=True)
 
         INDEX_STATUS["state"] = "ready"
         INDEX_STATUS["error"] = None
@@ -185,12 +205,12 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.2", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.3", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.2", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.3", "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/index/status")
