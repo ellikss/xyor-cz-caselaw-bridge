@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 DATASET = "overthelex/cz-court-decisions"
 HF_BASE = "https://datasets-server.huggingface.co"
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.3.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,8 +25,7 @@ async def hf_raw(endpoint: str, params: dict[str, Any], timeout: float = 45.0):
     clean["dataset"] = DATASET
     url = f"{HF_BASE}/{endpoint}"
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.get(url, params=clean)
-    return response
+        return await client.get(url, params=clean)
 
 
 async def hf_get(endpoint: str, params: dict[str, Any]):
@@ -71,8 +70,7 @@ async def background_probe():
             print("XYOR_PROBE_SPLITS_ERROR", split_response.text[:2000], flush=True)
             return
 
-        split_data = split_response.json()
-        splits = split_data.get("splits", [])
+        splits = split_response.json().get("splits", [])
         print("XYOR_PROBE_SPLITS", json.dumps(splits, ensure_ascii=False), flush=True)
 
         for item in splits:
@@ -89,33 +87,50 @@ async def background_probe():
             if rows_response.status_code < 400:
                 rows = rows_response.json().get("rows", [])
                 if rows:
-                    print(
-                        "XYOR_PROBE_ROW",
-                        config,
-                        split,
-                        json.dumps(compact_row(rows[0]), ensure_ascii=False),
-                        flush=True,
-                    )
+                    print("XYOR_PROBE_ROW", config, split, json.dumps(compact_row(rows[0]), ensure_ascii=False), flush=True)
 
-        search_response = await hf_raw(
-            "search",
+        filter_response = await hf_raw(
+            "filter",
             {
                 "config": "justice",
                 "split": "train",
-                "query": "10 C 73/2020-127",
+                "where": "case_number='10 C 73/2020-127'",
                 "offset": 0,
                 "length": 5,
             },
             timeout=20.0,
         )
-        print("XYOR_PROBE_SEARCH_STATUS", search_response.status_code, flush=True)
-        if search_response.status_code < 400:
-            rows = search_response.json().get("rows", [])
-            print("XYOR_PROBE_SEARCH_COUNT", len(rows), flush=True)
+        print("XYOR_PROBE_FILTER_STATUS", filter_response.status_code, flush=True)
+        if filter_response.status_code < 400:
+            rows = filter_response.json().get("rows", [])
+            print("XYOR_PROBE_FILTER_COUNT", len(rows), flush=True)
             for row in rows[:3]:
-                print("XYOR_PROBE_SEARCH_ROW", json.dumps(compact_row(row), ensure_ascii=False), flush=True)
+                print("XYOR_PROBE_FILTER_ROW", json.dumps(compact_row(row), ensure_ascii=False), flush=True)
         else:
-            print("XYOR_PROBE_SEARCH_ERROR", search_response.text[:2000], flush=True)
+            print("XYOR_PROBE_FILTER_ERROR", filter_response.text[:2000], flush=True)
+
+        try:
+            search_response = await hf_raw(
+                "search",
+                {
+                    "config": "justice",
+                    "split": "train",
+                    "query": "10 C 73/2020-127",
+                    "offset": 0,
+                    "length": 5,
+                },
+                timeout=60.0,
+            )
+            print("XYOR_PROBE_SEARCH_STATUS", search_response.status_code, flush=True)
+            if search_response.status_code < 400:
+                rows = search_response.json().get("rows", [])
+                print("XYOR_PROBE_SEARCH_COUNT", len(rows), flush=True)
+                for row in rows[:3]:
+                    print("XYOR_PROBE_SEARCH_ROW", json.dumps(compact_row(row), ensure_ascii=False), flush=True)
+            else:
+                print("XYOR_PROBE_SEARCH_ERROR", search_response.text[:2000], flush=True)
+        except Exception as exc:
+            print("XYOR_PROBE_SEARCH_EXCEPTION", repr(exc), flush=True)
     except Exception as exc:
         print("XYOR_PROBE_EXCEPTION", repr(exc), flush=True)
     finally:
@@ -134,7 +149,7 @@ async def health():
         "service": "XYOR CZ Case-Law Bridge",
         "dataset": DATASET,
         "mode": "read-only",
-        "version": "0.3.0",
+        "version": "0.4.0",
     }
 
 
@@ -144,38 +159,15 @@ async def splits():
 
 
 @app.get("/rows")
-async def rows(
-    config: str,
-    split: str = "train",
-    offset: int = Query(0, ge=0),
-    length: int = Query(10, ge=1, le=100),
-):
+async def rows(config: str, split: str = "train", offset: int = Query(0, ge=0), length: int = Query(10, ge=1, le=100)):
     return await hf_get("rows", {"config": config, "split": split, "offset": offset, "length": length})
 
 
 @app.get("/search")
-async def search(
-    config: str,
-    q: str,
-    split: str = "train",
-    offset: int = Query(0, ge=0),
-    length: int = Query(20, ge=1, le=100),
-):
-    return await hf_get(
-        "search",
-        {"config": config, "split": split, "query": q, "offset": offset, "length": length},
-    )
+async def search(config: str, q: str, split: str = "train", offset: int = Query(0, ge=0), length: int = Query(20, ge=1, le=100)):
+    return await hf_get("search", {"config": config, "split": split, "query": q, "offset": offset, "length": length})
 
 
 @app.get("/filter")
-async def filter_rows(
-    config: str,
-    where: str,
-    split: str = "train",
-    offset: int = Query(0, ge=0),
-    length: int = Query(20, ge=1, le=100),
-):
-    return await hf_get(
-        "filter",
-        {"config": config, "split": split, "where": where, "offset": offset, "length": length},
-    )
+async def filter_rows(config: str, where: str, split: str = "train", offset: int = Query(0, ge=0), length: int = Query(20, ge=1, le=100)):
+    return await hf_get("filter", {"config": config, "split": split, "where": where, "offset": offset, "length": length})
