@@ -21,7 +21,7 @@ CONFIG_COLUMNS = {
 }
 TOPIC_COLUMNS = ["case_number", "court_name", "ecli", "subject"]
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.7.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -153,6 +153,22 @@ def _evidence_windows(text: str, needle: str, radius: int, max_matches: int) -> 
     return windows
 
 
+def _text_quality(text: str) -> dict[str, Any]:
+    text = text or ""
+    replacement_count = text.count("\ufffd")
+    marker_counts = {m: text.count(m) for m in ("Ã", "Å", "Ä", "Â") if text.count(m)}
+    marker_total = sum(marker_counts.values())
+    suspect = replacement_count > 0 or marker_total >= 3
+    return {
+        "state": "CORRUPT_OR_MOJIBAKE" if suspect else "NO_OBVIOUS_ENCODING_DAMAGE",
+        "replacement_char_count": replacement_count,
+        "mojibake_markers": marker_counts,
+        "mojibake_marker_total": marker_total,
+        "encoding_quote_gate_pass": not suspect,
+        "note": "Encoding gate only. R6C identity/context/voice/applicability gates remain mandatory.",
+    }
+
+
 async def _get_row(config: str, row_idx: int) -> dict[str, Any]:
     payload = await hf_get("rows", {"config": config, "split": "train", "offset": row_idx, "length": 1})
     rows = payload.get("rows", [])
@@ -232,19 +248,61 @@ async def build_candidate_index():
         print("XYOR_INDEX_ERROR", repr(exc), flush=True)
 
 
+async def czcdc_quality_probe():
+    while INDEX_STATUS.get("state") not in {"ready", "error"}:
+        await asyncio.sleep(2)
+    if INDEX_STATUS.get("state") != "ready":
+        return
+    print("XYOR_CZCDC_QUALITY_PROBE_START", flush=True)
+    fixture = None
+    for row_idx in (0, 1, 2, 10, 100, 1000, 5000, 10000):
+        try:
+            item = await _get_row("czcdc", row_idx)
+            row = item.get("row") or {}
+            text = row.get("full_text") or ""
+            quality = _text_quality(text)
+            probe = {
+                "row_idx": row_idx,
+                "case_number": row.get("case_number"),
+                "court_name": row.get("court_name"),
+                "decision_date": row.get("decision_date"),
+                "chars": len(text),
+                "quality": quality,
+            }
+            print("XYOR_CZCDC_QUALITY_ROW", json.dumps(probe, ensure_ascii=False), flush=True)
+            if not quality["encoding_quote_gate_pass"]:
+                fixture = {
+                    **probe,
+                    "prefix": text[:900],
+                    "expected_quote_gate": "BLOCK",
+                }
+                print("XYOR_CZCDC_CORRUPT_FIXTURE", json.dumps(fixture, ensure_ascii=False), flush=True)
+                break
+        except Exception as exc:
+            print("XYOR_CZCDC_QUALITY_ERROR", row_idx, repr(exc), flush=True)
+    if fixture is None:
+        print("XYOR_CZCDC_CORRUPT_FIXTURE_NOT_FOUND_IN_SAMPLE", flush=True)
+    print("XYOR_CZCDC_QUALITY_PROBE_END", flush=True)
+
+
 @app.on_event("startup")
 async def startup():
     asyncio.create_task(build_candidate_index())
 
 
+@app.on_event("startup")
+async def startup_quality_probe():
+    asyncio.create_task(czcdc_quality_probe())
+
+
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.7.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.8.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.7.0", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.8.0", "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/index/status")
@@ -267,14 +325,8 @@ async def case_by_row(config: str, row_idx: int = Query(..., ge=0)):
     return await _get_row(config, row_idx)
 
 
-@app.get("/evidence")
-async def evidence(
-    config: str,
-    row_idx: int = Query(..., ge=0),
-    needle: str = Query(..., min_length=1),
-    radius: int = Query(700, ge=100, le=3000),
-    max_matches: int = Query(5, ge=1, le=20),
-):
+@app.get("/quality")
+async def quality_by_row(config: str, row_idx: int = Query(..., ge=0)):
     item = await _get_row(config, row_idx)
     row = item.get("row") or {}
     full_text = row.get("full_text") or ""
@@ -286,10 +338,42 @@ async def evidence(
         "decision_date": row.get("decision_date"),
         "ecli": row.get("ecli"),
         "source_url": row.get("source_url"),
+        "full_text_chars": len(full_text),
+        "quality": _text_quality(full_text),
+    }
+
+
+@app.get("/evidence")
+async def evidence(
+    config: str,
+    row_idx: int = Query(..., ge=0),
+    needle: str = Query(..., min_length=1),
+    radius: int = Query(700, ge=100, le=3000),
+    max_matches: int = Query(5, ge=1, le=20),
+):
+    item = await _get_row(config, row_idx)
+    row = item.get("row") or {}
+    full_text = row.get("full_text") or ""
+    quality = _text_quality(full_text)
+    encoding_pass = quality["encoding_quote_gate_pass"]
+    return {
+        "config": config,
+        "row_idx": row_idx,
+        "case_number": row.get("case_number"),
+        "court_name": row.get("court_name"),
+        "decision_date": row.get("decision_date"),
+        "ecli": row.get("ecli"),
+        "source_url": row.get("source_url"),
         "needle": needle,
         "full_text_chars": len(full_text),
-        "matches": _evidence_windows(full_text, needle, radius, max_matches),
-        "warning": "Context windows are retrieval evidence only; court voice/holding/applicability still require R6C review.",
+        "text_quality": quality,
+        "encoding_quote_gate_pass": encoding_pass,
+        "matches": _evidence_windows(full_text, needle, radius, max_matches) if encoding_pass else [],
+        "warning": (
+            "Encoding damage detected: exact-passage output blocked; recover readable official text before quotation/precise holding."
+            if not encoding_pass else
+            "Context windows are retrieval evidence only; court voice/holding/applicability still require R6C review."
+        ),
     }
 
 
