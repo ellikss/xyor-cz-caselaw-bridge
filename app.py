@@ -1,3 +1,4 @@
+import asyncio
 import json
 from typing import Any
 
@@ -8,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 DATASET = "overthelex/cz-court-decisions"
 HF_BASE = "https://datasets-server.huggingface.co"
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.2.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,11 +20,11 @@ app.add_middleware(
 )
 
 
-async def hf_raw(endpoint: str, params: dict[str, Any]):
+async def hf_raw(endpoint: str, params: dict[str, Any], timeout: float = 45.0):
     clean = {k: v for k, v in params.items() if v is not None}
     clean["dataset"] = DATASET
     url = f"{HF_BASE}/{endpoint}"
-    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         response = await client.get(url, params=clean)
     return response
 
@@ -51,7 +52,9 @@ def compact_row(row_obj: dict[str, Any]) -> dict[str, Any]:
         "row_idx": row_obj.get("row_idx"),
         "case_number": row.get("case_number"),
         "court_name": row.get("court_name"),
+        "court_type": row.get("court_type"),
         "decision_date": row.get("decision_date"),
+        "ecli": row.get("ecli"),
         "source_url": row.get("source_url"),
         "cited_provisions": row.get("cited_provisions"),
         "full_text_prefix": text,
@@ -59,16 +62,11 @@ def compact_row(row_obj: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@app.on_event("startup")
-async def startup_probe():
+async def background_probe():
     print("XYOR_PROBE_START", flush=True)
     try:
-        split_response = await hf_raw("splits", {})
-        print(
-            "XYOR_PROBE_SPLITS_STATUS",
-            split_response.status_code,
-            flush=True,
-        )
+        split_response = await hf_raw("splits", {}, timeout=20.0)
+        print("XYOR_PROBE_SPLITS_STATUS", split_response.status_code, flush=True)
         if split_response.status_code >= 400:
             print("XYOR_PROBE_SPLITS_ERROR", split_response.text[:2000], flush=True)
             return
@@ -77,29 +75,19 @@ async def startup_probe():
         splits = split_data.get("splits", [])
         print("XYOR_PROBE_SPLITS", json.dumps(splits, ensure_ascii=False), flush=True)
 
-        seen = set()
         for item in splits:
             config = item.get("config")
             split = item.get("split")
-            key = (config, split)
-            if not config or not split or key in seen:
+            if not config or not split:
                 continue
-            seen.add(key)
-
             rows_response = await hf_raw(
                 "rows",
                 {"config": config, "split": split, "offset": 0, "length": 1},
+                timeout=20.0,
             )
-            print(
-                "XYOR_PROBE_ROWS_STATUS",
-                config,
-                split,
-                rows_response.status_code,
-                flush=True,
-            )
+            print("XYOR_PROBE_ROWS_STATUS", config, split, rows_response.status_code, flush=True)
             if rows_response.status_code < 400:
-                rows_data = rows_response.json()
-                rows = rows_data.get("rows", [])
+                rows = rows_response.json().get("rows", [])
                 if rows:
                     print(
                         "XYOR_PROBE_ROW",
@@ -109,36 +97,34 @@ async def startup_probe():
                         flush=True,
                     )
 
-        justice_splits = [x for x in splits if x.get("config") == "justice"]
-        if justice_splits:
-            split = justice_splits[0].get("split", "train")
-            search_response = await hf_raw(
-                "search",
-                {
-                    "config": "justice",
-                    "split": split,
-                    "query": "10 C 73/2020-127",
-                    "offset": 0,
-                    "length": 5,
-                },
-            )
-            print("XYOR_PROBE_SEARCH_STATUS", search_response.status_code, flush=True)
-            if search_response.status_code < 400:
-                search_data = search_response.json()
-                rows = search_data.get("rows", [])
-                print("XYOR_PROBE_SEARCH_COUNT", len(rows), flush=True)
-                for row in rows[:3]:
-                    print(
-                        "XYOR_PROBE_SEARCH_ROW",
-                        json.dumps(compact_row(row), ensure_ascii=False),
-                        flush=True,
-                    )
-            else:
-                print("XYOR_PROBE_SEARCH_ERROR", search_response.text[:2000], flush=True)
+        search_response = await hf_raw(
+            "search",
+            {
+                "config": "justice",
+                "split": "train",
+                "query": "10 C 73/2020-127",
+                "offset": 0,
+                "length": 5,
+            },
+            timeout=20.0,
+        )
+        print("XYOR_PROBE_SEARCH_STATUS", search_response.status_code, flush=True)
+        if search_response.status_code < 400:
+            rows = search_response.json().get("rows", [])
+            print("XYOR_PROBE_SEARCH_COUNT", len(rows), flush=True)
+            for row in rows[:3]:
+                print("XYOR_PROBE_SEARCH_ROW", json.dumps(compact_row(row), ensure_ascii=False), flush=True)
+        else:
+            print("XYOR_PROBE_SEARCH_ERROR", search_response.text[:2000], flush=True)
     except Exception as exc:
         print("XYOR_PROBE_EXCEPTION", repr(exc), flush=True)
     finally:
         print("XYOR_PROBE_END", flush=True)
+
+
+@app.on_event("startup")
+async def startup_probe():
+    asyncio.create_task(background_probe())
 
 
 @app.get("/health")
@@ -148,7 +134,7 @@ async def health():
         "service": "XYOR CZ Case-Law Bridge",
         "dataset": DATASET,
         "mode": "read-only",
-        "version": "0.2.0",
+        "version": "0.3.0",
     }
 
 
@@ -164,10 +150,7 @@ async def rows(
     offset: int = Query(0, ge=0),
     length: int = Query(10, ge=1, le=100),
 ):
-    return await hf_get(
-        "rows",
-        {"config": config, "split": split, "offset": offset, "length": length},
-    )
+    return await hf_get("rows", {"config": config, "split": split, "offset": offset, "length": length})
 
 
 @app.get("/search")
@@ -180,13 +163,7 @@ async def search(
 ):
     return await hf_get(
         "search",
-        {
-            "config": config,
-            "split": split,
-            "query": q,
-            "offset": offset,
-            "length": length,
-        },
+        {"config": config, "split": split, "query": q, "offset": offset, "length": length},
     )
 
 
@@ -200,11 +177,5 @@ async def filter_rows(
 ):
     return await hf_get(
         "filter",
-        {
-            "config": config,
-            "split": split,
-            "where": where,
-            "offset": offset,
-            "length": length,
-        },
+        {"config": config, "split": split, "where": where, "offset": offset, "length": length},
     )
