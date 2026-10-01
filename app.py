@@ -19,9 +19,9 @@ CONFIG_COLUMNS = {
         "case_number", "court_name", "court_type", "decision_date", "ecli", "subject",
     ],
 }
-SEARCH_COLUMNS = ["case_number", "court_name", "ecli", "subject", "cited_provisions"]
+TOPIC_COLUMNS = ["case_number", "court_name", "ecli", "subject"]
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.1")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,11 +66,7 @@ def _build_one_config(config: str, files: list[dict[str, Any]]) -> pl.DataFrame:
 
 
 def _index_summary(df: pl.DataFrame) -> dict[str, Any]:
-    sizes = sorted(
-        ((name, df[name].estimated_size()) for name in df.columns),
-        key=lambda x: x[1],
-        reverse=True,
-    )
+    sizes = sorted(((name, df[name].estimated_size()) for name in df.columns), key=lambda x: x[1], reverse=True)
     return {
         "rows": df.height,
         "columns": df.columns,
@@ -96,12 +92,6 @@ def _tokenize_query(q: str) -> list[str]:
     return out[:8]
 
 
-def _search_expr(df: pl.DataFrame, col: str) -> pl.Expr:
-    if col == "cited_provisions":
-        return pl.col(col).list.join(" ").fill_null("")
-    return pl.col(col).cast(pl.String, strict=False).fill_null("")
-
-
 def _candidate_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
     tokens = _tokenize_query(q)
     if not tokens:
@@ -110,9 +100,9 @@ def _candidate_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
     for token in tokens:
         pattern = "(?i)" + re.escape(token)
         hit = pl.lit(False)
-        for col in SEARCH_COLUMNS:
+        for col in TOPIC_COLUMNS:
             if col in df.columns:
-                hit = hit | _search_expr(df, col).str.contains(pattern)
+                hit = hit | pl.col(col).cast(pl.String, strict=False).fill_null("").str.contains(pattern)
         score = score + hit.cast(pl.Int16)
     sort_cols = ["_score"] + (["decision_date"] if "decision_date" in df.columns else [])
     return (
@@ -120,6 +110,20 @@ def _candidate_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
         .with_columns(score.alias("_score"))
         .filter(pl.col("_score") > 0)
         .sort(sort_cols, descending=[True] * len(sort_cols), nulls_last=True)
+        .head(limit)
+        .collect()
+    )
+
+
+def _provision_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
+    if "cited_provisions" not in df.columns:
+        return df.head(0)
+    pattern = "(?i)" + re.escape(q.strip())
+    mask = pl.col("cited_provisions").list.eval(pl.element().str.contains(pattern)).list.any()
+    return (
+        df.lazy()
+        .filter(mask.fill_null(False))
+        .sort("decision_date", descending=True, nulls_last=True)
         .head(limit)
         .collect()
     )
@@ -160,13 +164,13 @@ async def build_candidate_index():
             INDEX_STATUS["configs"][config] = {"state": "ready", "parquet_files": len(files), **summary}
             print("XYOR_INDEX_CONFIG_READY", config, json.dumps(INDEX_STATUS["configs"][config], ensure_ascii=False), flush=True)
 
-        INDEX_STATUS["state"] = "ready"
-        INDEX_STATUS["error"] = None
-
         test = INDEX["justice"].filter(pl.col("case_number") == "10 C 73/2020-127").head(1)
         print("XYOR_INDEX_EXACT_TEST", json.dumps(test.to_dicts(), ensure_ascii=False), flush=True)
         topical = await asyncio.to_thread(_candidate_search, INDEX["justice"], "výpověď nájmu bytu", 3)
         print("XYOR_INDEX_TOPIC_TEST", json.dumps(topical.to_dicts(), ensure_ascii=False), flush=True)
+
+        INDEX_STATUS["state"] = "ready"
+        INDEX_STATUS["error"] = None
         print("XYOR_INDEX_READY", flush=True)
     except Exception as exc:
         INDEX_STATUS["state"] = "error"
@@ -181,12 +185,12 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.1", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.2", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.1", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.2", "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/index/status")
@@ -229,3 +233,12 @@ async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": config})
     result = await asyncio.to_thread(_candidate_search, df, q, limit)
     return {"config": config, "query": q, "tokens": _tokenize_query(q), "count": result.height, "candidates": result.to_dicts()}
+
+
+@app.get("/provisions")
+async def provisions(q: str, limit: int = Query(20, ge=1, le=50)):
+    df = INDEX.get("justice")
+    if df is None:
+        raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": "justice"})
+    result = await asyncio.to_thread(_provision_search, df, q, limit)
+    return {"config": "justice", "query": q, "count": result.height, "candidates": result.to_dicts()}
