@@ -1,6 +1,5 @@
-import os
 import json
-from typing import Optional
+from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
@@ -9,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 DATASET = "overthelex/cz-court-decisions"
 HF_BASE = "https://datasets-server.huggingface.co"
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.1.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,22 +18,128 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def hf_get(endpoint: str, params: dict):
-    params = {k: v for k, v in params.items() if v is not None}
-    params["dataset"] = DATASET
+
+async def hf_raw(endpoint: str, params: dict[str, Any]):
+    clean = {k: v for k, v in params.items() if v is not None}
+    clean["dataset"] = DATASET
     url = f"{HF_BASE}/{endpoint}"
     async with httpx.AsyncClient(timeout=45.0, follow_redirects=True) as client:
-        r = await client.get(url, params=params)
-    if r.status_code >= 400:
+        response = await client.get(url, params=clean)
+    return response
+
+
+async def hf_get(endpoint: str, params: dict[str, Any]):
+    response = await hf_raw(endpoint, params)
+    if response.status_code >= 400:
         raise HTTPException(
             status_code=502,
             detail={
-                "upstream_status": r.status_code,
-                "upstream_url": str(r.request.url),
-                "upstream_body": r.text[:2000],
+                "upstream_status": response.status_code,
+                "upstream_url": str(response.request.url),
+                "upstream_body": response.text[:2000],
             },
         )
-    return r.json()
+    return response.json()
+
+
+def compact_row(row_obj: dict[str, Any]) -> dict[str, Any]:
+    row = row_obj.get("row") or {}
+    text = row.get("full_text")
+    if isinstance(text, str):
+        text = text[:1500]
+    return {
+        "row_idx": row_obj.get("row_idx"),
+        "case_number": row.get("case_number"),
+        "court_name": row.get("court_name"),
+        "decision_date": row.get("decision_date"),
+        "source_url": row.get("source_url"),
+        "cited_provisions": row.get("cited_provisions"),
+        "full_text_prefix": text,
+        "keys": sorted(row.keys()),
+    }
+
+
+@app.on_event("startup")
+async def startup_probe():
+    print("XYOR_PROBE_START", flush=True)
+    try:
+        split_response = await hf_raw("splits", {})
+        print(
+            "XYOR_PROBE_SPLITS_STATUS",
+            split_response.status_code,
+            flush=True,
+        )
+        if split_response.status_code >= 400:
+            print("XYOR_PROBE_SPLITS_ERROR", split_response.text[:2000], flush=True)
+            return
+
+        split_data = split_response.json()
+        splits = split_data.get("splits", [])
+        print("XYOR_PROBE_SPLITS", json.dumps(splits, ensure_ascii=False), flush=True)
+
+        seen = set()
+        for item in splits:
+            config = item.get("config")
+            split = item.get("split")
+            key = (config, split)
+            if not config or not split or key in seen:
+                continue
+            seen.add(key)
+
+            rows_response = await hf_raw(
+                "rows",
+                {"config": config, "split": split, "offset": 0, "length": 1},
+            )
+            print(
+                "XYOR_PROBE_ROWS_STATUS",
+                config,
+                split,
+                rows_response.status_code,
+                flush=True,
+            )
+            if rows_response.status_code < 400:
+                rows_data = rows_response.json()
+                rows = rows_data.get("rows", [])
+                if rows:
+                    print(
+                        "XYOR_PROBE_ROW",
+                        config,
+                        split,
+                        json.dumps(compact_row(rows[0]), ensure_ascii=False),
+                        flush=True,
+                    )
+
+        justice_splits = [x for x in splits if x.get("config") == "justice"]
+        if justice_splits:
+            split = justice_splits[0].get("split", "train")
+            search_response = await hf_raw(
+                "search",
+                {
+                    "config": "justice",
+                    "split": split,
+                    "query": "10 C 73/2020-127",
+                    "offset": 0,
+                    "length": 5,
+                },
+            )
+            print("XYOR_PROBE_SEARCH_STATUS", search_response.status_code, flush=True)
+            if search_response.status_code < 400:
+                search_data = search_response.json()
+                rows = search_data.get("rows", [])
+                print("XYOR_PROBE_SEARCH_COUNT", len(rows), flush=True)
+                for row in rows[:3]:
+                    print(
+                        "XYOR_PROBE_SEARCH_ROW",
+                        json.dumps(compact_row(row), ensure_ascii=False),
+                        flush=True,
+                    )
+            else:
+                print("XYOR_PROBE_SEARCH_ERROR", search_response.text[:2000], flush=True)
+    except Exception as exc:
+        print("XYOR_PROBE_EXCEPTION", repr(exc), flush=True)
+    finally:
+        print("XYOR_PROBE_END", flush=True)
+
 
 @app.get("/health")
 async def health():
@@ -43,11 +148,14 @@ async def health():
         "service": "XYOR CZ Case-Law Bridge",
         "dataset": DATASET,
         "mode": "read-only",
+        "version": "0.2.0",
     }
+
 
 @app.get("/splits")
 async def splits():
     return await hf_get("splits", {})
+
 
 @app.get("/rows")
 async def rows(
@@ -60,6 +168,7 @@ async def rows(
         "rows",
         {"config": config, "split": split, "offset": offset, "length": length},
     )
+
 
 @app.get("/search")
 async def search(
@@ -74,11 +183,12 @@ async def search(
         {
             "config": config,
             "split": split,
-            "q": q,
+            "query": q,
             "offset": offset,
             "length": length,
         },
     )
+
 
 @app.get("/filter")
 async def filter_rows(
