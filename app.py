@@ -21,7 +21,7 @@ CONFIG_COLUMNS = {
 }
 SEARCH_COLUMNS = ["case_number", "court_name", "ecli", "subject", "cited_provisions"]
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -96,6 +96,12 @@ def _tokenize_query(q: str) -> list[str]:
     return out[:8]
 
 
+def _search_expr(df: pl.DataFrame, col: str) -> pl.Expr:
+    if col == "cited_provisions":
+        return pl.col(col).list.join(" ").fill_null("")
+    return pl.col(col).cast(pl.String, strict=False).fill_null("")
+
+
 def _candidate_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
     tokens = _tokenize_query(q)
     if not tokens:
@@ -106,15 +112,14 @@ def _candidate_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
         hit = pl.lit(False)
         for col in SEARCH_COLUMNS:
             if col in df.columns:
-                hit = hit | pl.col(col).cast(pl.String, strict=False).fill_null("").str.contains(pattern)
+                hit = hit | _search_expr(df, col).str.contains(pattern)
         score = score + hit.cast(pl.Int16)
     sort_cols = ["_score"] + (["decision_date"] if "decision_date" in df.columns else [])
-    descending = [True] * len(sort_cols)
     return (
         df.lazy()
         .with_columns(score.alias("_score"))
         .filter(pl.col("_score") > 0)
-        .sort(sort_cols, descending=descending, nulls_last=True)
+        .sort(sort_cols, descending=[True] * len(sort_cols), nulls_last=True)
         .head(limit)
         .collect()
     )
@@ -176,12 +181,12 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.1", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.0", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.1", "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/index/status")
