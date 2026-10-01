@@ -21,7 +21,7 @@ CONFIG_COLUMNS = {
 }
 TOPIC_COLUMNS = ["case_number", "court_name", "ecli", "subject"]
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.6.3")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.7.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,6 +129,38 @@ def _provision_search(df: pl.DataFrame, q: str, limit: int) -> pl.DataFrame:
     )
 
 
+def _evidence_windows(text: str, needle: str, radius: int, max_matches: int) -> list[dict[str, Any]]:
+    if not text or not needle:
+        return []
+    low_text = text.lower()
+    low_needle = needle.lower()
+    windows: list[dict[str, Any]] = []
+    pos = 0
+    while len(windows) < max_matches:
+        idx = low_text.find(low_needle, pos)
+        if idx < 0:
+            break
+        start = max(0, idx - radius)
+        end = min(len(text), idx + len(needle) + radius)
+        windows.append({
+            "match_start": idx,
+            "match_end": idx + len(needle),
+            "context_start": start,
+            "context_end": end,
+            "context": text[start:end],
+        })
+        pos = idx + max(1, len(needle))
+    return windows
+
+
+async def _get_row(config: str, row_idx: int) -> dict[str, Any]:
+    payload = await hf_get("rows", {"config": config, "split": "train", "offset": row_idx, "length": 1})
+    rows = payload.get("rows", [])
+    if not rows:
+        raise HTTPException(status_code=404, detail="row not found")
+    return rows[0]
+
+
 async def build_candidate_index():
     INDEX_STATUS["state"] = "building"
     print("XYOR_INDEX_START", flush=True)
@@ -175,19 +207,21 @@ async def build_candidate_index():
 
         if topical.height:
             row_idx = int(topical[0, "row_idx"])
-            row_payload = await hf_get("rows", {"config": "justice", "split": "train", "offset": row_idx, "length": 1}, timeout=30.0)
-            row_items = row_payload.get("rows", [])
-            if row_items:
-                row = row_items[0].get("row") or {}
-                full_text = row.get("full_text") or ""
-                print("XYOR_INDEX_FULLTEXT_TEST", json.dumps({
-                    "row_idx": row_idx,
-                    "case_number": row.get("case_number"),
-                    "court_name": row.get("court_name"),
-                    "source_url": row.get("source_url"),
-                    "full_text_chars": len(full_text),
-                    "full_text_nonempty": bool(full_text.strip()),
-                }, ensure_ascii=False), flush=True)
+            row_item = await _get_row("justice", row_idx)
+            row = row_item.get("row") or {}
+            full_text = row.get("full_text") or ""
+            print("XYOR_INDEX_FULLTEXT_TEST", json.dumps({
+                "row_idx": row_idx,
+                "case_number": row.get("case_number"),
+                "court_name": row.get("court_name"),
+                "source_url": row.get("source_url"),
+                "full_text_chars": len(full_text),
+                "full_text_nonempty": bool(full_text.strip()),
+            }, ensure_ascii=False), flush=True)
+            for needle in ("odvolací soud", "soud dospěl", "výpověď", "nájmu bytu"):
+                wins = _evidence_windows(full_text, needle, 650, 2)
+                if wins:
+                    print("XYOR_QUOTE_PROBE", needle, json.dumps(wins, ensure_ascii=False), flush=True)
 
         INDEX_STATUS["state"] = "ready"
         INDEX_STATUS["error"] = None
@@ -205,12 +239,12 @@ async def startup():
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.6.3", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.7.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.6.3", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.7.0", "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/index/status")
@@ -230,11 +264,33 @@ async def rows(config: str, split: str = "train", offset: int = Query(0, ge=0), 
 
 @app.get("/case")
 async def case_by_row(config: str, row_idx: int = Query(..., ge=0)):
-    payload = await hf_get("rows", {"config": config, "split": "train", "offset": row_idx, "length": 1})
-    rows = payload.get("rows", [])
-    if not rows:
-        raise HTTPException(status_code=404, detail="row not found")
-    return rows[0]
+    return await _get_row(config, row_idx)
+
+
+@app.get("/evidence")
+async def evidence(
+    config: str,
+    row_idx: int = Query(..., ge=0),
+    needle: str = Query(..., min_length=1),
+    radius: int = Query(700, ge=100, le=3000),
+    max_matches: int = Query(5, ge=1, le=20),
+):
+    item = await _get_row(config, row_idx)
+    row = item.get("row") or {}
+    full_text = row.get("full_text") or ""
+    return {
+        "config": config,
+        "row_idx": row_idx,
+        "case_number": row.get("case_number"),
+        "court_name": row.get("court_name"),
+        "decision_date": row.get("decision_date"),
+        "ecli": row.get("ecli"),
+        "source_url": row.get("source_url"),
+        "needle": needle,
+        "full_text_chars": len(full_text),
+        "matches": _evidence_windows(full_text, needle, radius, max_matches),
+        "warning": "Context windows are retrieval evidence only; court voice/holding/applicability still require R6C review.",
+    }
 
 
 @app.get("/resolve")
