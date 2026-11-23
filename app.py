@@ -546,7 +546,7 @@ async def quality_by_row(config: str, row_idx: int = Query(..., ge=0)):
 async def evidence(
     config: str,
     row_idx: int = Query(..., ge=0),
-    needle: str = Query(..., min_length=1),
+    needle: str = Query(..., min_length=1, max_length=200),
     radius: int = Query(700, ge=100, le=3000),
     max_matches: int = Query(5, ge=1, le=20),
 ):
@@ -577,7 +577,7 @@ async def evidence(
 
 
 @app.get("/resolve")
-async def resolve_case(case_number: str, config: str = "justice", limit: int = Query(10, ge=1, le=50)):
+async def resolve_case(case_number: str = Query(..., min_length=1, max_length=200), config: str = "justice", limit: int = Query(10, ge=1, le=50)):
     _check_config(config)
     if INDEX_MODE == "remote":
         return await _remote_filter(config, min(limit, 20), case_number=case_number)
@@ -589,7 +589,7 @@ async def resolve_case(case_number: str, config: str = "justice", limit: int = Q
 
 
 @app.get("/candidates")
-async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=1, le=50)):
+async def candidates(q: str = Query(..., min_length=2, max_length=200), config: str = "justice", limit: int = Query(20, ge=1, le=50)):
     _check_config(config)
     if INDEX_MODE == "remote":
         return await _remote_search(q, config, min(limit, 20))
@@ -601,7 +601,7 @@ async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=
 
 
 @app.get("/provisions")
-async def provisions(q: str, limit: int = Query(20, ge=1, le=50)):
+async def provisions(q: str = Query(..., min_length=1, max_length=120), limit: int = Query(20, ge=1, le=50)):
     if INDEX_MODE == "remote":
         result = await _remote_search(q, "justice", min(limit, 20))
         needle = q.casefold()
