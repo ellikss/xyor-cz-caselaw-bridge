@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import re
 from typing import Any
 
@@ -20,8 +21,11 @@ CONFIG_COLUMNS = {
     ],
 }
 TOPIC_COLUMNS = ["case_number", "court_name", "ecli", "subject"]
+INDEX_MODE = os.getenv("XYOR_INDEX_MODE", "remote").lower()
+if INDEX_MODE not in ("remote", "memory"):
+    raise ValueError("XYOR_INDEX_MODE must be remote or memory")
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.8.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,14 +46,30 @@ async def hf_raw(endpoint: str, params: dict[str, Any], timeout: float = 45.0):
 
 
 async def hf_get(endpoint: str, params: dict[str, Any], timeout: float = 45.0):
-    response = await hf_raw(endpoint, params, timeout=timeout)
+    try:
+        response = await hf_raw(endpoint, params, timeout=timeout)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=503, detail={"reason": "UPSTREAM_UNAVAILABLE",
+                                                     "endpoint": endpoint,
+                                                     "error_type": type(exc).__name__}) from exc
     if response.status_code >= 400:
-        raise HTTPException(status_code=502, detail={
-            "upstream_status": response.status_code,
-            "upstream_url": str(response.request.url),
-            "upstream_body": response.text[:2000],
-        })
-    return response.json()
+        try:
+            error = response.json().get("error", "")
+        except (ValueError, AttributeError):
+            error = ""
+        if response.status_code in (500, 502, 503) and isinstance(error, str) and "index is loading" in error.lower():
+            raise HTTPException(status_code=503,
+                                detail={"reason": "HF_INDEX_LOADING", "endpoint": endpoint,
+                                        "retryable": True},
+                                headers={"Retry-After": "30"})
+        raise HTTPException(status_code=502, detail={"reason": "UPSTREAM_HTTP_ERROR",
+                                                     "endpoint": endpoint,
+                                                     "upstream_status": response.status_code})
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail={"reason": "UPSTREAM_INVALID_JSON",
+                                                     "endpoint": endpoint}) from exc
 
 
 def _build_one_config(config: str, files: list[dict[str, Any]]) -> pl.DataFrame:
@@ -169,12 +189,119 @@ def _text_quality(text: str) -> dict[str, Any]:
     }
 
 
+
+def _check_config(config: str) -> str:
+    if config not in CONFIG_COLUMNS:
+        raise HTTPException(status_code=422, detail={"reason": "UNSUPPORTED_CONFIG",
+                                                     "allowed": list(CONFIG_COLUMNS)})
+    return config
+
+
+def _metadata_row(item: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(item, dict) or not isinstance(item.get("row_idx"), int) or item["row_idx"] < 0:
+        raise HTTPException(status_code=502, detail="UPSTREAM_INVALID_ROW_INDEX")
+    row = item.get("row")
+    if not isinstance(row, dict):
+        raise HTTPException(status_code=502, detail="UPSTREAM_INVALID_ROW")
+    keys = ("case_number", "court_name", "court_type", "decision_date", "ecli", "subject",
+            "cited_provisions", "source_url")
+    return {
+        "row_idx": item["row_idx"],
+        **{key: row.get(key) for key in keys},
+        "has_text": bool((row.get("full_text") or "").strip()),
+        "truncated_cells": item.get("truncated_cells") or [],
+    }
+
+
+def _remote_result(payload: dict[str, Any], *, config: str, mode: str, query: str) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+        raise HTTPException(status_code=502, detail="UPSTREAM_INVALID_ROW_RESULT")
+    candidates = [_metadata_row(item) for item in payload["rows"]]
+    return {
+        "config": config,
+        "mode": mode,
+        "query": query,
+        "count": len(candidates),
+        "num_rows_total_reported": payload.get("num_rows_total"),
+        "upstream_partial": payload.get("partial"),
+        "exhaustive_legal_corpus_search": False,
+        "source_gate": "CZ_SEARCH_LEAD_ONLY",
+        "candidates": candidates,
+    }
+
+
+async def _remote_search(q: str, config: str, limit: int, offset: int = 0) -> dict[str, Any]:
+    _check_config(config)
+    data = await hf_get("search", {
+        "config": config, "split": "train", "query": q, "offset": offset, "length": limit,
+    })
+    return _remote_result(data, config=config, mode="HF_TEXT_SEARCH", query=q)
+
+
+async def _remote_filter(config: str, limit: int, offset: int = 0, *,
+                         case_number: str | None = None, court_name: str | None = None) -> dict[str, Any]:
+    _check_config(config)
+    if not case_number and not court_name:
+        raise HTTPException(status_code=422, detail="case_number or court_name required")
+    def quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+    predicates = []
+    if case_number:
+        predicates.append('"case_number"=' + quote(case_number))
+    if court_name:
+        predicates.append('"court_name"=' + quote(court_name))
+    where = " AND ".join(predicates)
+    data = await hf_get("filter", {
+        "config": config, "split": "train", "where": where, "offset": offset, "length": limit,
+    })
+    result = _remote_result(data, config=config, mode="HF_EXACT_FILTER", query=where)
+    result["no_match_is_conclusive"] = False
+    return result
+
+
+def _full_text_truncated(item: dict[str, Any]) -> bool:
+    return any("full_text" in str(cell) for cell in (item.get("truncated_cells") or []))
+
 async def _get_row(config: str, row_idx: int) -> dict[str, Any]:
+    _check_config(config)
     payload = await hf_get("rows", {"config": config, "split": "train", "offset": row_idx, "length": 1})
     rows = payload.get("rows", [])
     if not rows:
         raise HTTPException(status_code=404, detail="row not found")
-    return rows[0]
+    item = rows[0]
+    # The viewer's own row_idx must be consistent with the requested offset.
+    if item.get("row_idx") != row_idx:
+        raise HTTPException(status_code=503, detail={
+            "source_alignment": "VIEWER_ROW_INDEX_MISMATCH",
+            "requested_row_idx": row_idx,
+            "returned_row_idx": item.get("row_idx"),
+        })
+    return item
+
+
+async def _check_index_alignment(config: str, df: pl.DataFrame) -> dict[str, Any]:
+    if df.is_empty() or "case_number" not in df.columns:
+        raise RuntimeError(f"empty or malformed index for {config}")
+    positions = sorted({0, min(1000, df.height - 1), df.height // 2, df.height - 1})
+    probes = []
+    for row_idx in positions:
+        item = await _get_row(config, row_idx)
+        source = item.get("row") or {}
+        expected_case = df[row_idx, "case_number"]
+        observed_case = source.get("case_number")
+        # Compare more than one field where possible; reject absent identities.
+        matching_fields = ["case_number", "court_name", "decision_date", "ecli"]
+        mismatches = {}
+        for field in matching_fields:
+            if field in df.columns:
+                indexed = df[row_idx, field]
+                upstream = source.get(field)
+                if indexed != upstream:
+                    mismatches[field] = {"indexed": str(indexed), "upstream": str(upstream)}
+        if not expected_case or not observed_case or mismatches:
+            raise RuntimeError(f"INDEX_SOURCE_MISMATCH {config} row={row_idx} {mismatches!r}")
+        probes.append({"row_idx": row_idx, "case_number": expected_case, "match": True})
+    return {"alignment_probes": probes, "alignment_verified": True}
 
 
 async def build_candidate_index():
@@ -192,24 +319,13 @@ async def build_candidate_index():
             INDEX_STATUS["configs"][config] = {"state": "building", "parquet_files": len(files)}
             print("XYOR_INDEX_CONFIG_START", config, len(files), flush=True)
             df = await asyncio.to_thread(_build_one_config, config, files)
-            INDEX[config] = df
             summary = _index_summary(df)
-
-            probe_idx = 1000 if df.height > 1000 else 0
-            if df.height:
-                probe = await hf_get("rows", {"config": config, "split": "train", "offset": probe_idx, "length": 1}, timeout=20.0)
-                rows = probe.get("rows", [])
-                if rows:
-                    hf_case = (rows[0].get("row") or {}).get("case_number")
-                    idx_case = df[probe_idx, "case_number"]
-                    summary["alignment_probe"] = {
-                        "row_idx": probe_idx,
-                        "hf_case_number": hf_case,
-                        "index_case_number": idx_case,
-                        "match": hf_case == idx_case,
-                    }
-
-            INDEX_STATUS["configs"][config] = {"state": "ready", "parquet_files": len(files), **summary}
+            alignment = await _check_index_alignment(config, df)
+            # Expose the index only after its source-alignment checks pass.
+            INDEX[config] = df
+            INDEX_STATUS["configs"][config] = {
+                "state": "ready", "parquet_files": len(files), **summary, **alignment
+            }
             print("XYOR_INDEX_CONFIG_READY", config, json.dumps(INDEX_STATUS["configs"][config], ensure_ascii=False), flush=True)
 
         exact = INDEX["justice"].filter(pl.col("case_number") == "10 C 73/2020-127").head(1)
@@ -243,6 +359,10 @@ async def build_candidate_index():
         INDEX_STATUS["error"] = None
         print("XYOR_INDEX_READY", flush=True)
     except Exception as exc:
+        # Do not serve a partially built or partly validated index.
+        INDEX.clear()
+        for cfg in INDEX_STATUS["configs"].values():
+            cfg["state"] = "error"
         INDEX_STATUS["state"] = "error"
         INDEX_STATUS["error"] = repr(exc)
         print("XYOR_INDEX_ERROR", repr(exc), flush=True)
@@ -287,27 +407,82 @@ async def czcdc_quality_probe():
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(build_candidate_index())
+    if INDEX_MODE == "memory":
+        asyncio.create_task(build_candidate_index())
+    else:
+        INDEX_STATUS.update({"state": "remote_only", "configs": {}, "error": None})
 
 
 @app.on_event("startup")
 async def startup_quality_probe():
-    asyncio.create_task(czcdc_quality_probe())
+    if INDEX_MODE == "memory":
+        asyncio.create_task(czcdc_quality_probe())
 
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.8.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.9.0", "dataset": DATASET, "index_mode": INDEX_MODE, "index_state": INDEX_STATUS["state"], "legal_release": "BLOCKED"}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.8.0", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.9.0", "index_mode": INDEX_MODE, "index_state": INDEX_STATUS["state"], "upstream_verified": False, "legal_release": "BLOCKED"}
 
 
 @app.get("/index/status")
 async def index_status():
-    return INDEX_STATUS
+    return {**INDEX_STATUS, "index_mode": INDEX_MODE}
+
+
+@app.get("/ready")
+async def ready():
+    data = await hf_get("is-valid", {}, timeout=15.0)
+    if not isinstance(data, dict) or not all(data.get(feature) for feature in ("viewer", "search", "filter")):
+        raise HTTPException(status_code=503, detail={"reason": "HF_REQUIRED_FEATURE_UNAVAILABLE",
+                                                     "features": data if isinstance(data, dict) else None})
+    try:
+        # is-valid can be true while row-serving is broken; probe actual data.
+        checks = {}
+        for config in CONFIG_COLUMNS:
+            sample = await hf_get("rows", {
+                "config": config, "split": "train", "offset": 0, "length": 1,
+            }, timeout=20.0)
+            rows = sample.get("rows") if isinstance(sample, dict) else None
+            if not rows or rows[0].get("row_idx") != 0:
+                raise HTTPException(status_code=503, detail={"reason": "HF_INVALID_FIRST_ROW", "config": config})
+            checks[config] = True
+        query = await hf_get("search", {
+            "config": "justice", "split": "train", "query": "nájem", "offset": 0, "length": 1,
+        }, timeout=20.0)
+        if not isinstance(query, dict) or not isinstance(query.get("rows"), list):
+            raise HTTPException(status_code=503, detail={"reason": "HF_INVALID_SEARCH"})
+        # A fixed syntactically valid case identifier probes filter availability.
+        # A valid filter response must be a structured page; empty results can be partial.
+        filtered = await hf_get("filter", {
+            "config": "justice", "split": "train",
+            "where": '"case_number"=\'10 C 73/2020-127\'',
+            "offset": 0, "length": 1,
+        }, timeout=20.0)
+        if not isinstance(filtered, dict) or not isinstance(filtered.get("rows"), list):
+            raise HTTPException(status_code=503, detail={"reason": "HF_INVALID_FILTER"})
+    except HTTPException as exc:
+        raise HTTPException(status_code=503, detail={
+            "reason": "HF_DATA_ENDPOINT_NOT_READY",
+            "upstream": exc.detail,
+        }, headers=exc.headers) from exc
+    return {"ok": True, "index_mode": INDEX_MODE, "hf_viewer": True,
+            "hf_search": True, "hf_filter": True,
+            "row_configs_checked": list(CONFIG_COLUMNS),
+            "legal_release": "BLOCKED"}
+
+
+@app.get("/capabilities")
+async def capabilities():
+    return {"version": "0.9.0", "dataset": DATASET, "index_mode": INDEX_MODE,
+            "routes": ["/health", "/ready", "/capabilities", "/splits", "/rows",
+                       "/search", "/filter", "/resolve", "/candidates",
+                       "/provisions", "/case", "/quality", "/evidence", "/index/status"],
+            "source_gate": "CZ_SEARCH_LEAD_ONLY", "legal_release": "BLOCKED"}
 
 
 @app.get("/splits")
@@ -316,13 +491,35 @@ async def splits():
 
 
 @app.get("/rows")
-async def rows(config: str, split: str = "train", offset: int = Query(0, ge=0), length: int = Query(10, ge=1, le=100)):
-    return await hf_get("rows", {"config": config, "split": split, "offset": offset, "length": length})
+async def rows(config: str, offset: int = Query(0, ge=0), length: int = Query(5, ge=1, le=20)):
+    _check_config(config)
+    payload = await hf_get("rows", {"config": config, "split": "train", "offset": offset, "length": length})
+    return _remote_result(payload, config=config, mode="HF_ROWS", query=str(offset))
+
+
+@app.get("/search")
+async def search(q: str = Query(..., min_length=2, max_length=200),
+                 config: str = "justice",
+                 limit: int = Query(10, ge=1, le=20),
+                 offset: int = Query(0, ge=0)):
+    return await _remote_search(q, config, limit, offset)
+
+
+@app.get("/filter")
+async def filter_cases(config: str = "justice",
+                       case_number: str | None = Query(None, min_length=1, max_length=200),
+                       court_name: str | None = Query(None, min_length=1, max_length=200),
+                       limit: int = Query(10, ge=1, le=20),
+                       offset: int = Query(0, ge=0)):
+    return await _remote_filter(config, limit, offset, case_number=case_number, court_name=court_name)
 
 
 @app.get("/case")
 async def case_by_row(config: str, row_idx: int = Query(..., ge=0)):
-    return await _get_row(config, row_idx)
+    item = await _get_row(config, row_idx)
+    return {"config": config, "viewer_row": item, "source_gate": "CZ_SEARCH_LEAD_ONLY",
+            "full_text_truncated": _full_text_truncated(item),
+            "warning": "HF viewer text is not a verified official court original."}
 
 
 @app.get("/quality")
@@ -340,6 +537,8 @@ async def quality_by_row(config: str, row_idx: int = Query(..., ge=0)):
         "source_url": row.get("source_url"),
         "full_text_chars": len(full_text),
         "quality": _text_quality(full_text),
+        "full_text_truncated": _full_text_truncated(item),
+        "source_gate": "CZ_SEARCH_LEAD_ONLY",
     }
 
 
@@ -347,7 +546,7 @@ async def quality_by_row(config: str, row_idx: int = Query(..., ge=0)):
 async def evidence(
     config: str,
     row_idx: int = Query(..., ge=0),
-    needle: str = Query(..., min_length=1),
+    needle: str = Query(..., min_length=1, max_length=200),
     radius: int = Query(700, ge=100, le=3000),
     max_matches: int = Query(5, ge=1, le=20),
 ):
@@ -355,7 +554,7 @@ async def evidence(
     row = item.get("row") or {}
     full_text = row.get("full_text") or ""
     quality = _text_quality(full_text)
-    encoding_pass = quality["encoding_quote_gate_pass"]
+    encoding_pass = quality["encoding_quote_gate_pass"] and bool(full_text.strip()) and not _full_text_truncated(item)
     return {
         "config": config,
         "row_idx": row_idx,
@@ -370,7 +569,7 @@ async def evidence(
         "encoding_quote_gate_pass": encoding_pass,
         "matches": _evidence_windows(full_text, needle, radius, max_matches) if encoding_pass else [],
         "warning": (
-            "Encoding damage detected: exact-passage output blocked; recover readable official text before quotation/precise holding."
+            "Text missing, truncated or encoding-damaged: evidence windows blocked; obtain full original."
             if not encoding_pass else
             "Context windows are retrieval evidence only; court voice/holding/applicability still require R6C review."
         ),
@@ -378,8 +577,11 @@ async def evidence(
 
 
 @app.get("/resolve")
-async def resolve_case(case_number: str, config: str = "justice", limit: int = Query(10, ge=1, le=50)):
-    df = INDEX.get(config)
+async def resolve_case(case_number: str = Query(..., min_length=1, max_length=200), config: str = "justice", limit: int = Query(10, ge=1, le=50)):
+    _check_config(config)
+    if INDEX_MODE == "remote":
+        return await _remote_filter(config, min(limit, 20), case_number=case_number)
+    df = INDEX.get(config) if INDEX_STATUS["state"] == "ready" else None
     if df is None:
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": config})
     result = df.filter(pl.col("case_number") == case_number).head(limit)
@@ -387,8 +589,11 @@ async def resolve_case(case_number: str, config: str = "justice", limit: int = Q
 
 
 @app.get("/candidates")
-async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=1, le=50)):
-    df = INDEX.get(config)
+async def candidates(q: str = Query(..., min_length=2, max_length=200), config: str = "justice", limit: int = Query(20, ge=1, le=50)):
+    _check_config(config)
+    if INDEX_MODE == "remote":
+        return await _remote_search(q, config, min(limit, 20))
+    df = INDEX.get(config) if INDEX_STATUS["state"] == "ready" else None
     if df is None:
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": config})
     result = await asyncio.to_thread(_candidate_search, df, q, limit)
@@ -396,8 +601,19 @@ async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=
 
 
 @app.get("/provisions")
-async def provisions(q: str, limit: int = Query(20, ge=1, le=50)):
-    df = INDEX.get("justice")
+async def provisions(q: str = Query(..., min_length=1, max_length=120), limit: int = Query(20, ge=1, le=50)):
+    if INDEX_MODE == "remote":
+        result = await _remote_search(q, "justice", min(limit, 20))
+        needle = q.casefold()
+        result["candidates"] = [
+            candidate for candidate in result["candidates"]
+            if any(needle in str(p).casefold()
+                   for p in (candidate.get("cited_provisions") or []))
+        ]
+        result["count"] = len(result["candidates"])
+        result["mode"] = "HF_PARTIAL_PROVISION_LEADS"
+        return result
+    df = INDEX.get("justice") if INDEX_STATUS["state"] == "ready" else None
     if df is None:
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": "justice"})
     result = await asyncio.to_thread(_provision_search, df, q, limit)

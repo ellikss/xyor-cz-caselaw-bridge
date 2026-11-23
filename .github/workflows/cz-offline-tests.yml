@@ -1,0 +1,30 @@
+name: CZ offline source alignment tests
+
+on:
+  push:
+    paths:
+      - 'app.py'
+      - 'tests/**'
+      - '.github/workflows/cz-offline-tests.yml'
+  pull_request:
+    paths:
+      - 'app.py'
+      - 'tests/**'
+      - '.github/workflows/cz-offline-tests.yml'
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m py_compile app.py legislation_app.py tests/test_alignment.py
+      - name: Run fail-closed regression suite
+        run: python -m unittest discover -s tests -v
