@@ -21,7 +21,7 @@ CONFIG_COLUMNS = {
 }
 TOPIC_COLUMNS = ["case_number", "court_name", "ecli", "subject"]
 
-app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.8.0")
+app = FastAPI(title="XYOR CZ Case-Law Bridge", version="0.8.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -174,7 +174,40 @@ async def _get_row(config: str, row_idx: int) -> dict[str, Any]:
     rows = payload.get("rows", [])
     if not rows:
         raise HTTPException(status_code=404, detail="row not found")
-    return rows[0]
+    item = rows[0]
+    # The viewer's own row_idx must be consistent with the requested offset.
+    if item.get("row_idx") != row_idx:
+        raise HTTPException(status_code=503, detail={
+            "source_alignment": "VIEWER_ROW_INDEX_MISMATCH",
+            "requested_row_idx": row_idx,
+            "returned_row_idx": item.get("row_idx"),
+        })
+    return item
+
+
+async def _check_index_alignment(config: str, df: pl.DataFrame) -> dict[str, Any]:
+    if df.is_empty() or "case_number" not in df.columns:
+        raise RuntimeError(f"empty or malformed index for {config}")
+    positions = sorted({0, min(1000, df.height - 1), df.height // 2, df.height - 1})
+    probes = []
+    for row_idx in positions:
+        item = await _get_row(config, row_idx)
+        source = item.get("row") or {}
+        expected_case = df[row_idx, "case_number"]
+        observed_case = source.get("case_number")
+        # Compare more than one field where possible; reject absent identities.
+        matching_fields = ["case_number", "court_name", "decision_date", "ecli"]
+        mismatches = {}
+        for field in matching_fields:
+            if field in df.columns:
+                indexed = df[row_idx, field]
+                upstream = source.get(field)
+                if indexed != upstream:
+                    mismatches[field] = {"indexed": str(indexed), "upstream": str(upstream)}
+        if not expected_case or not observed_case or mismatches:
+            raise RuntimeError(f"INDEX_SOURCE_MISMATCH {config} row={row_idx} {mismatches!r}")
+        probes.append({"row_idx": row_idx, "case_number": expected_case, "match": True})
+    return {"alignment_probes": probes, "alignment_verified": True}
 
 
 async def build_candidate_index():
@@ -192,24 +225,13 @@ async def build_candidate_index():
             INDEX_STATUS["configs"][config] = {"state": "building", "parquet_files": len(files)}
             print("XYOR_INDEX_CONFIG_START", config, len(files), flush=True)
             df = await asyncio.to_thread(_build_one_config, config, files)
-            INDEX[config] = df
             summary = _index_summary(df)
-
-            probe_idx = 1000 if df.height > 1000 else 0
-            if df.height:
-                probe = await hf_get("rows", {"config": config, "split": "train", "offset": probe_idx, "length": 1}, timeout=20.0)
-                rows = probe.get("rows", [])
-                if rows:
-                    hf_case = (rows[0].get("row") or {}).get("case_number")
-                    idx_case = df[probe_idx, "case_number"]
-                    summary["alignment_probe"] = {
-                        "row_idx": probe_idx,
-                        "hf_case_number": hf_case,
-                        "index_case_number": idx_case,
-                        "match": hf_case == idx_case,
-                    }
-
-            INDEX_STATUS["configs"][config] = {"state": "ready", "parquet_files": len(files), **summary}
+            alignment = await _check_index_alignment(config, df)
+            # Expose the index only after its source-alignment checks pass.
+            INDEX[config] = df
+            INDEX_STATUS["configs"][config] = {
+                "state": "ready", "parquet_files": len(files), **summary, **alignment
+            }
             print("XYOR_INDEX_CONFIG_READY", config, json.dumps(INDEX_STATUS["configs"][config], ensure_ascii=False), flush=True)
 
         exact = INDEX["justice"].filter(pl.col("case_number") == "10 C 73/2020-127").head(1)
@@ -243,6 +265,10 @@ async def build_candidate_index():
         INDEX_STATUS["error"] = None
         print("XYOR_INDEX_READY", flush=True)
     except Exception as exc:
+        # Do not serve a partially built or partly validated index.
+        INDEX.clear()
+        for cfg in INDEX_STATUS["configs"].values():
+            cfg["state"] = "error"
         INDEX_STATUS["state"] = "error"
         INDEX_STATUS["error"] = repr(exc)
         print("XYOR_INDEX_ERROR", repr(exc), flush=True)
@@ -297,12 +323,12 @@ async def startup_quality_probe():
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.8.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.8.1", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.8.0", "index_state": INDEX_STATUS["state"]}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.8.1", "index_state": INDEX_STATUS["state"], "legal_release": "BLOCKED"}
 
 
 @app.get("/index/status")
@@ -379,7 +405,7 @@ async def evidence(
 
 @app.get("/resolve")
 async def resolve_case(case_number: str, config: str = "justice", limit: int = Query(10, ge=1, le=50)):
-    df = INDEX.get(config)
+    df = INDEX.get(config) if INDEX_STATUS["state"] == "ready" else None
     if df is None:
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": config})
     result = df.filter(pl.col("case_number") == case_number).head(limit)
@@ -388,7 +414,7 @@ async def resolve_case(case_number: str, config: str = "justice", limit: int = Q
 
 @app.get("/candidates")
 async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=1, le=50)):
-    df = INDEX.get(config)
+    df = INDEX.get(config) if INDEX_STATUS["state"] == "ready" else None
     if df is None:
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": config})
     result = await asyncio.to_thread(_candidate_search, df, q, limit)
@@ -397,7 +423,7 @@ async def candidates(q: str, config: str = "justice", limit: int = Query(20, ge=
 
 @app.get("/provisions")
 async def provisions(q: str, limit: int = Query(20, ge=1, le=50)):
-    df = INDEX.get("justice")
+    df = INDEX.get("justice") if INDEX_STATUS["state"] == "ready" else None
     if df is None:
         raise HTTPException(status_code=503, detail={"index_state": INDEX_STATUS["state"], "config": "justice"})
     result = await asyncio.to_thread(_provision_search, df, q, limit)
