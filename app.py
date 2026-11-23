@@ -53,6 +53,15 @@ async def hf_get(endpoint: str, params: dict[str, Any], timeout: float = 45.0):
                                                      "endpoint": endpoint,
                                                      "error_type": type(exc).__name__}) from exc
     if response.status_code >= 400:
+        try:
+            error = response.json().get("error", "")
+        except (ValueError, AttributeError):
+            error = ""
+        if response.status_code in (500, 502, 503) and isinstance(error, str) and "index is loading" in error.lower():
+            raise HTTPException(status_code=503,
+                                detail={"reason": "HF_INDEX_LOADING", "endpoint": endpoint,
+                                        "retryable": True},
+                                headers={"Retry-After": "30"})
         raise HTTPException(status_code=502, detail={"reason": "UPSTREAM_HTTP_ERROR",
                                                      "endpoint": endpoint,
                                                      "upstream_status": response.status_code})
@@ -460,7 +469,7 @@ async def ready():
         raise HTTPException(status_code=503, detail={
             "reason": "HF_DATA_ENDPOINT_NOT_READY",
             "upstream": exc.detail,
-        }) from exc
+        }, headers=exc.headers) from exc
     return {"ok": True, "index_mode": INDEX_MODE, "hf_viewer": True,
             "hf_search": True, "hf_filter": True,
             "row_configs_checked": list(CONFIG_COLUMNS),
