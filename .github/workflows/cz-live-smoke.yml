@@ -1,0 +1,30 @@
+name: CZ external API smoke
+
+on:
+  push:
+    paths:
+      - 'app.py'
+      - 'scripts/live_smoke.py'
+      - '.github/workflows/cz-live-smoke.yml'
+  pull_request:
+    paths:
+      - 'app.py'
+      - 'scripts/live_smoke.py'
+      - '.github/workflows/cz-live-smoke.yml'
+  workflow_dispatch:
+
+jobs:
+  hf-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      XYOR_INDEX_MODE: remote
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Dependencies
+        run: pip install -r requirements.txt
+      - name: Test real Hugging Face Dataset Viewer through FastAPI
+        run: python scripts/live_smoke.py
