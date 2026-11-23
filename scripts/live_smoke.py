@@ -107,7 +107,21 @@ with TestClient(app) as client:
         ("/resolve", {"case_number": exact_number, "config": "justice", "limit": 1}),
         ("/provisions", {"q": "§ 2291", "limit": 1}),
     ]:
-        data = require(client.get(route, params=params), route)
+        response = None
+        for attempt in range(1, 6):
+            response = client.get(route, params=params)
+            print("ROUTE_ATTEMPT", route, attempt, response.status_code, flush=True)
+            if response.status_code == 200:
+                break
+            if response.status_code != 503 or attempt == 5:
+                break
+            detail = response.json().get("detail") or {}
+            if not isinstance(detail, dict) or detail.get("reason") not in (
+                "HF_INDEX_LOADING", "UPSTREAM_UNAVAILABLE", "HF_DATA_ENDPOINT_NOT_READY",
+            ):
+                break
+            time.sleep(15)
+        data = require(response, route)
         assert data["source_gate"] == "CZ_SEARCH_LEAD_ONLY", route
         assert isinstance(data["count"], int), route
         assert not data["exhaustive_legal_corpus_search"], route
