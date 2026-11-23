@@ -42,8 +42,9 @@ Always record: title, exact URL/ID, court, chamber/senate if shown, date, case n
 Do not automatically infer precedent strength from court level, date or similarity score. Do not make mandatory-application claims across jurisdictions. Czech law is usually comparative context for LV disputes, unless independently established otherwise.
 
 ## Technical guards
-- `/health` indicates process only. `/index/status` plus configuration-specific integrity checks determine index availability.
-- Require consistent ordering between parquet-index row and Hugging Face dataset viewer row, multiple deterministic probes, identity comparison, total-row-count checks and per-row retrieval verification.
+- `/health` indicates process only. `/ready` must probe actual external HF rows/search/filter for the read-only `remote` mode, and must return 503 if upstream is unavailable. HF `/is-valid` alone is insufficient. `/index/status` and configuration-specific identity checks govern the optional `memory` mode.
+- Default deployment: `XYOR_INDEX_MODE=remote`, with no corpus download, no large startup index. `/search` and `/filter` are delegated to HF and are not exhaustive legal searches; `/provisions` in remote mode is only a post-filtered page of HF text search, not a provision corpus index.
+- Optional memory index: require consistent ordering between parquet-index row and Hugging Face viewer row, multiple deterministic probes, identity comparison, total-row-count checks and per-row retrieval verification.
 - Any shard/index/identity mismatch, missing mandatory field, upstream failure, partial Parquet conversion, corrupted original, or unverified court identity => **FAIL CLOSED**; never issue a holding or quote gate.
 - Dataset revisions/fingerprints must be pinned for reproducibility before legal release. Until then: non-deterministic upstream dependency.
 - Encoding heuristics detect only obvious damage. Passing them is not proof of correctness, source fidelity, official status or complete text.
@@ -62,3 +63,6 @@ Never assert that this skill is installed or active merely because this file exi
 
 ## Release gates
 R0 code available; R1 index tested; R2 official provenance; R3 complete original and encoding; R4 holding and context; R5 temporal applicability; R6 license for the actual use; R7 end-to-end integration and regression tests. `PRODUCTION_PASS` only if each required gate has recorded evidence; otherwise `BLOCKED`.
+
+## Future Mac corpus import (not required for this release)
+When independently sorted official originals become available, ingest them as immutable files with SHA-256, exact source URL, court, date, case number, optional ECLI, OCR/encoding and import provenance. The future local provider MUST be optional and preserve the public HTTP contract. Never mark an uploaded or synced file as official until provenance is validated. No Google Drive full-corpus sync is assumed.
