@@ -53,10 +53,26 @@ def upstream_diagnostics():
 
 
 with TestClient(app) as client:
+    import time
     capabilities = require(client.get("/capabilities"), "capabilities")
     assert capabilities["source_gate"] == "CZ_SEARCH_LEAD_ONLY"
     assert capabilities["index_mode"] == "remote", "live smoke expects no in-memory Parquet index"
-    require(client.get("/ready"), "ready")
+    ready_response = None
+    for attempt in range(1, 6):
+        ready_response = client.get("/ready")
+        print("READY_ATTEMPT", attempt, ready_response.status_code, flush=True)
+        if ready_response.status_code == 200:
+            break
+        if ready_response.status_code != 503 or attempt == 5:
+            break
+        detail = ready_response.json().get("detail") or {}
+        upstream = detail.get("upstream") if isinstance(detail, dict) else {}
+        upstream = upstream if isinstance(upstream, dict) else {}
+        if upstream.get("reason") not in ("HF_INDEX_LOADING", "UPSTREAM_UNAVAILABLE", "UPSTREAM_HTTP_ERROR"):
+            break
+        print("HF_INDEX_WARMING_OR_UNAVAILABLE; RETRYING", flush=True)
+        time.sleep(20)
+    require(ready_response, "ready")
 
     splits = require(client.get("/splits"), "splits")
     available = {(item.get("config"), item.get("split")) for item in splits.get("splits", [])}
