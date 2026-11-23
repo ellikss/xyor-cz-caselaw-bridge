@@ -15,6 +15,8 @@ from app import app
 def require(response, name):
     print("PROBE", name, "HTTP", response.status_code, flush=True)
     if response.status_code != 200:
+        if name in ("/search", "/filter", "/resolve", "/candidates", "/provisions", "ready"):
+            upstream_diagnostics()
         raise RuntimeError(f"{name}: HTTP {response.status_code}: {response.text[:500]}")
     data = response.json()
     if not isinstance(data, dict):
