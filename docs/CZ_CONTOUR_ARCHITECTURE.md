@@ -3,7 +3,7 @@
 Status: design baseline / NOT production-ready. Branch work cannot imply deployment.
 
 ## Independent lines
-- `CZ-CASELAW` = `app.py`, Hugging Face retrieval/index, official source verification layer (to build).
+- `CZ-CASELAW` = `app.py`, default remote HF Dataset Viewer API (no local corpus), optional `memory` Parquet index, official source verification layer (to build).
 - `CZ-LEGISLATION` = `legislation_app.py`, unofficial current/historical snapshots; official version/effective-date gate (to build).
 - `CZ-SKILL` = `skills/xyor-cz-caselaw/SKILL.md`, legal-source and holding method, not a deployed plugin.
 - `CZ-LEGAL-GATE` = licensing, temporal checks, citation validation, output blocking.
@@ -39,3 +39,11 @@ Norm, time, applicability, license verified -> legal document eligibility.
 
 ## Non-goals
 No hardcoded Ellikss litigation examples in corpus or tests. No assumption that Czech judgments bind a Latvian court. No legal release merely because an API returns HTTP 200.
+
+## 2026-11-23 remote-first MVP
+- Default `XYOR_INDEX_MODE=remote` and Render environment uses it explicitly.
+- No Mac sorting, Google Drive sync, corpus download, or in-memory index is required to start the API.
+- Expose `/search`, bounded `/filter`, `/resolve`, `/candidates`, `/provisions` (partial), `/case`, `/quality`, `/evidence`.
+- If HF search or rows fail, API must return a clear 502/503, never a fabricated empty search result.
+- A later verified local-provider adapter may be added behind the same API, independently tested, without rewriting the CZ skill.
+- Online smoke CI must pass against real provider. CI passing for offline tests does not override online smoke failures.
