@@ -160,6 +160,32 @@ class RemoteShellTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 503)
 
 
+
+    def test_loading_index_is_retryable_not_empty_result(self):
+        import httpx
+        request = httpx.Request("GET", "https://datasets-server.huggingface.co/search")
+        async def fake_raw(endpoint, params, timeout=45.0):
+            return httpx.Response(500, request=request,
+                                  json={"error": "the dataset index is loading, this can take a minute"})
+        with patch.object(bridge, "hf_raw", side_effect=fake_raw):
+            with self.assertRaises(bridge.HTTPException) as ctx:
+                asyncio.run(bridge.hf_get("search", {"config": "justice"}))
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["reason"], "HF_INDEX_LOADING")
+        self.assertEqual(ctx.exception.headers["Retry-After"], "30")
+
+    def test_ready_blocks_when_row_endpoint_is_broken(self):
+        async def fake(endpoint, params, timeout=45.0):
+            if endpoint == "is-valid":
+                return {"viewer": True, "search": True, "filter": True}
+            raise bridge.HTTPException(status_code=502, detail={"reason": "UPSTREAM_HTTP_ERROR"})
+        with patch.object(bridge, "hf_get", side_effect=fake):
+            with self.assertRaises(bridge.HTTPException) as ctx:
+                asyncio.run(bridge.ready())
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["reason"], "HF_DATA_ENDPOINT_NOT_READY")
+
+
 class ApiValidationTests(unittest.TestCase):
     def test_invalid_config_is_http_422(self):
         from fastapi.testclient import TestClient
