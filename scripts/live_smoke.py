@@ -22,6 +22,34 @@ def require(response, name):
     return data
 
 
+def upstream_diagnostics():
+    """Print bounded external-provider errors; never log decision full texts."""
+    import httpx
+    base = "https://datasets-server.huggingface.co"
+    common = {"dataset": "overthelex/cz-court-decisions", "config": "justice", "split": "train"}
+    probes = [
+        ("rows", {**common, "offset": 0, "length": 1}),
+        ("first-rows", common),
+        ("search", {**common, "query": "nájem", "offset": 0, "length": 1}),
+        ("filter", {**common, "where": "\"case_number\"='10 C 73/2020-127'", "offset": 0, "length": 1}),
+        ("parquet", {"dataset": common["dataset"]}),
+    ]
+    for endpoint, params in probes:
+        try:
+            response = httpx.get(base + "/" + endpoint, params=params, timeout=45.0)
+            detail = ""
+            if response.status_code != 200:
+                detail = response.text[:350].replace("\\n", " ")
+            else:
+                data = response.json()
+                detail = str({"keys": list(data.keys())[:8],
+                              "rows_count": len(data.get("rows", [])),
+                              "parquet_files": len(data.get("parquet_files", []))})
+            print("HF_DIAG", endpoint, response.status_code, detail, flush=True)
+        except Exception as exc:
+            print("HF_DIAG", endpoint, type(exc).__name__, str(exc)[:180], flush=True)
+
+
 with TestClient(app) as client:
     capabilities = require(client.get("/capabilities"), "capabilities")
     assert capabilities["source_gate"] == "CZ_SEARCH_LEAD_ONLY"
@@ -34,7 +62,11 @@ with TestClient(app) as client:
     assert ("czcdc", "train") in available, f"czcdc/train absent: {available}"
 
     for cfg in ("justice", "czcdc"):
-        rows = require(client.get("/rows", params={"config": cfg, "offset": 0, "length": 1}), f"rows:{cfg}")
+        try:
+            rows = require(client.get("/rows", params={"config": cfg, "offset": 0, "length": 1}), f"rows:{cfg}")
+        except RuntimeError:
+            upstream_diagnostics()
+            raise
         assert rows["count"] == 1
         assert rows["candidates"][0]["row_idx"] == 0
         assert rows["source_gate"] == "CZ_SEARCH_LEAD_ONLY"
