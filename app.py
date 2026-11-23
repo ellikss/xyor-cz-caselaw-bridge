@@ -431,9 +431,39 @@ async def ready():
     if not isinstance(data, dict) or not all(data.get(feature) for feature in ("viewer", "search", "filter")):
         raise HTTPException(status_code=503, detail={"reason": "HF_REQUIRED_FEATURE_UNAVAILABLE",
                                                      "features": data if isinstance(data, dict) else None})
+    try:
+        # is-valid can be true while row-serving is broken; probe actual data.
+        checks = {}
+        for config in CONFIG_COLUMNS:
+            sample = await hf_get("rows", {
+                "config": config, "split": "train", "offset": 0, "length": 1,
+            }, timeout=20.0)
+            rows = sample.get("rows") if isinstance(sample, dict) else None
+            if not rows or rows[0].get("row_idx") != 0:
+                raise HTTPException(status_code=503, detail={"reason": "HF_INVALID_FIRST_ROW", "config": config})
+            checks[config] = True
+        query = await hf_get("search", {
+            "config": "justice", "split": "train", "query": "nájem", "offset": 0, "length": 1,
+        }, timeout=20.0)
+        if not isinstance(query, dict) or not isinstance(query.get("rows"), list):
+            raise HTTPException(status_code=503, detail={"reason": "HF_INVALID_SEARCH"})
+        # A fixed syntactically valid case identifier probes filter availability.
+        # A valid filter response must be a structured page; empty results can be partial.
+        filtered = await hf_get("filter", {
+            "config": "justice", "split": "train",
+            "where": '"case_number"=\'10 C 73/2020-127\'',
+            "offset": 0, "length": 1,
+        }, timeout=20.0)
+        if not isinstance(filtered, dict) or not isinstance(filtered.get("rows"), list):
+            raise HTTPException(status_code=503, detail={"reason": "HF_INVALID_FILTER"})
+    except HTTPException as exc:
+        raise HTTPException(status_code=503, detail={
+            "reason": "HF_DATA_ENDPOINT_NOT_READY",
+            "upstream": exc.detail,
+        }) from exc
     return {"ok": True, "index_mode": INDEX_MODE, "hf_viewer": True,
-            "hf_search": bool(data.get("search")),
-            "hf_filter": bool(data.get("filter")),
+            "hf_search": True, "hf_filter": True,
+            "row_configs_checked": list(CONFIG_COLUMNS),
             "legal_release": "BLOCKED"}
 
 
