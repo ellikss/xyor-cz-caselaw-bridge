@@ -155,9 +155,9 @@ class RemoteShellTests(unittest.TestCase):
         async def fake(endpoint, params, timeout=45.0):
             return {"viewer": True, "search": False, "filter": False}
         with patch.object(bridge, "hf_get", side_effect=fake):
-            data = asyncio.run(bridge.ready())
-        self.assertFalse(data["hf_search"])
-        self.assertFalse(data["hf_filter"])
+            with self.assertRaises(bridge.HTTPException) as ctx:
+                asyncio.run(bridge.ready())
+        self.assertEqual(ctx.exception.status_code, 503)
 
 
 class ApiValidationTests(unittest.TestCase):
