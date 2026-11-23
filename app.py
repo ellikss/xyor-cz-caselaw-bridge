@@ -412,12 +412,12 @@ async def startup_quality_probe():
 
 @app.get("/")
 async def root():
-    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.9.0", "dataset": DATASET, "index_state": INDEX_STATUS["state"]}
+    return {"service": "XYOR CZ Case-Law Bridge", "version": "0.9.0", "dataset": DATASET, "index_mode": INDEX_MODE, "index_state": INDEX_STATUS["state"], "legal_release": "BLOCKED"}
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.9.0", "index_state": INDEX_STATUS["state"], "legal_release": "BLOCKED"}
+    return {"ok": True, "service": "XYOR CZ Case-Law Bridge", "dataset": DATASET, "mode": "read-only", "version": "0.9.0", "index_mode": INDEX_MODE, "index_state": INDEX_STATUS["state"], "upstream_verified": False, "legal_release": "BLOCKED"}
 
 
 @app.get("/index/status")
@@ -428,8 +428,9 @@ async def index_status():
 @app.get("/ready")
 async def ready():
     data = await hf_get("is-valid", {}, timeout=15.0)
-    if not isinstance(data, dict) or not data.get("viewer"):
-        raise HTTPException(status_code=503, detail={"reason": "HF_VIEWER_NOT_READY"})
+    if not isinstance(data, dict) or not all(data.get(feature) for feature in ("viewer", "search", "filter")):
+        raise HTTPException(status_code=503, detail={"reason": "HF_REQUIRED_FEATURE_UNAVAILABLE",
+                                                     "features": data if isinstance(data, dict) else None})
     return {"ok": True, "index_mode": INDEX_MODE, "hf_viewer": True,
             "hf_search": bool(data.get("search")),
             "hf_filter": bool(data.get("filter")),
@@ -497,6 +498,8 @@ async def quality_by_row(config: str, row_idx: int = Query(..., ge=0)):
         "source_url": row.get("source_url"),
         "full_text_chars": len(full_text),
         "quality": _text_quality(full_text),
+        "full_text_truncated": _full_text_truncated(item),
+        "source_gate": "CZ_SEARCH_LEAD_ONLY",
     }
 
 
