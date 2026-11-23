@@ -13,6 +13,10 @@ on:
       - '.github/workflows/cz-live-smoke.yml'
   workflow_dispatch:
 
+concurrency:
+  group: cz-live-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   hf-live:
     runs-on: ubuntu-latest
